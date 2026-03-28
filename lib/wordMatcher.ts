@@ -3,36 +3,67 @@ export function norm(w: string): string {
 }
 
 /**
- * Finds the new word position in `slideWords` based on the spoken transcript.
- * Scans forward from `fromIdx`, never backwards.
- * Uses a sliding window of the last 7 spoken words with a 45% match threshold.
- * Returns `fromIdx` unchanged if no match is found.
+ * Finds the speaker's current position in the slide text.
+ *
+ * Improvements over v1:
+ * - maxLookAhead: caps how far forward we scan (prevents wild page-skips)
+ * - Higher threshold: 60% match required (was 45%) — prevents false positives
+ * - Multi-window: tries 7-word then 5-word then 3-word windows with scaled thresholds
+ * - Never goes backward (forward-only scanning from fromIdx)
+ *
+ * @param slideWords - The slide's words (pre-split)
+ * @param spokenWords - The last N finalized spoken words
+ * @param fromIdx - The current word position (scan starts here)
+ * @param maxLookAhead - Max words to scan ahead from fromIdx (default 60)
+ * @returns New word index, or fromIdx if no confident match found
  */
 export function findPosition(
   slideWords: string[],
-  transcript: string,
-  fromIdx: number
+  spokenWords: string[],
+  fromIdx: number,
+  maxLookAhead = 60
 ): number {
-  const spokenWords = transcript
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .map(norm);
+  if (spokenWords.length === 0) return fromIdx;
 
-  const windowSize = Math.min(7, spokenWords.length);
-  const window = spokenWords.slice(-windowSize);
+  const normSlide = slideWords.map(norm);
+  const normSpoken = spokenWords.map(norm).filter(Boolean);
 
-  if (window.length === 0) return fromIdx;
+  if (normSpoken.length === 0) return fromIdx;
 
-  const threshold = Math.ceil(window.length * 0.45);
+  const scanEnd = Math.min(fromIdx + maxLookAhead, slideWords.length);
 
-  for (let i = fromIdx; i <= slideWords.length - window.length; i++) {
-    let matches = 0;
-    for (let j = 0; j < window.length; j++) {
-      if (norm(slideWords[i + j]) === window[j]) matches++;
+  // Try progressively smaller windows, each with an appropriate threshold
+  const windows = [
+    { size: Math.min(7, normSpoken.length), minMatchRatio: 0.65 },
+    { size: Math.min(5, normSpoken.length), minMatchRatio: 0.70 },
+    { size: Math.min(3, normSpoken.length), minMatchRatio: 0.80 },
+  ];
+
+  for (const { size, minMatchRatio } of windows) {
+    if (normSpoken.length < size) continue;
+
+    const window = normSpoken.slice(-size);
+    const threshold = Math.ceil(size * minMatchRatio);
+
+    let bestPos = -1;
+    let bestScore = 0;
+
+    for (let i = fromIdx; i <= scanEnd - size; i++) {
+      let score = 0;
+      for (let j = 0; j < size; j++) {
+        // Exact match only — 'norm' already strips punctuation/case
+        if (normSlide[i + j] === window[j]) score++;
+      }
+      if (score >= threshold && score > bestScore) {
+        bestScore = score;
+        bestPos = i + size;
+      }
     }
-    if (matches >= threshold) return i + window.length;
+
+    if (bestPos !== -1) {
+      return bestPos;
+    }
   }
 
-  return fromIdx;
+  return fromIdx; // No confident match — hold position
 }

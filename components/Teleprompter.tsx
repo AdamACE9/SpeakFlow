@@ -3,102 +3,97 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useSlidesStore } from "@/store/slidesStore";
-import { createSpeechEngine } from "@/lib/speechEngine";
+import { createSpeechEngine, SpeechEngine } from "@/lib/speechEngine";
 import { findPosition } from "@/lib/wordMatcher";
 import { MicPill, MicStatus } from "@/components/MicPill";
 
 type CountdownState = 3 | 2 | 1 | null;
-
-interface SpeechRecognitionInstance {
-  start: () => void;
-  stop: () => void;
-  abort: () => void;
-  continuous: boolean;
-  interimResults: boolean;
-  lang: string;
-  onresult: unknown;
-  onerror: unknown;
-  onend: unknown;
-  onstart: unknown;
-}
 
 export function Teleprompter() {
   const router = useRouter();
   const { slides, currentSlide, setCurrentSlide } = useSlidesStore();
 
   const [wordIdx, setWordIdx] = useState(0);
-  const [transcript, setTranscript] = useState("");
   const [micStatus, setMicStatus] = useState<MicStatus>("idle");
   const [countdown, setCountdown] = useState<CountdownState>(null);
+  const [interimText, setInterimText] = useState("");
 
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const engineRef = useRef<SpeechEngine | null>(null);
   const wordRefs = useRef<(HTMLSpanElement | null)[]>([]);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const transcriptRef = useRef("");
-  const wordIdxRef = useRef(0);
 
-  // Keep refs in sync with state
-  transcriptRef.current = transcript;
+  // Stable refs — avoid stale closures inside engine callbacks
+  const wordIdxRef = useRef(0);
+  const currentSlideRef = useRef(currentSlide);
+  const slidesRef = useRef(slides);
   wordIdxRef.current = wordIdx;
+  currentSlideRef.current = currentSlide;
+  slidesRef.current = slides;
 
   // Guard: redirect to upload if no slides loaded
   useEffect(() => {
-    if (slides.length === 0) {
-      router.replace("/");
-    }
+    if (slides.length === 0) router.replace("/");
   }, [slides, router]);
 
-  // Init speech engine
+  // Init Deepgram engine once slides are available
   useEffect(() => {
     if (slides.length === 0) return;
 
-    const rec = createSpeechEngine(
-      (t) => setTranscript(t),
+    const engine = createSpeechEngine(
+      ({ finalWords, interimText: interim }) => {
+        setInterimText(interim);
+
+        const slideText = slidesRef.current[currentSlideRef.current];
+        if (!slideText) return;
+        const slideWords = slideText.split(/\s+/).filter(Boolean);
+
+        // Combine committed final words + live interim words for real-time tracking.
+        // This makes the highlight move word-by-word AS you speak (not after).
+        const interimWords = interim.trim().split(/\s+/).filter(Boolean);
+        const allWords = [...finalWords, ...interimWords];
+        if (allWords.length === 0) return;
+
+        // Tighter look-ahead on interim-only to prevent false positives
+        const lookAhead = finalWords.length > 0 ? 60 : 15;
+        const newIdx = findPosition(slideWords, allWords, wordIdxRef.current, lookAhead);
+        if (newIdx > wordIdxRef.current) setWordIdx(newIdx);
+      },
       (err) => {
-        if (err === "not-allowed") setMicStatus("error");
-        else if (err === "not-supported") setMicStatus("not-supported");
+        if (err === "not-supported") setMicStatus("not-supported");
+        else if (err === "no-key") setMicStatus("no-key");
         else setMicStatus("error");
       },
-      (status) => setMicStatus(status)
+      (status) => {
+        // Map engine status → MicStatus
+        if (status === "connecting") setMicStatus("connecting");
+        else if (status === "listening") setMicStatus("listening");
+        else if (status === "reconnecting") setMicStatus("reconnecting");
+        else setMicStatus("idle");
+      }
     );
 
-    recognitionRef.current = rec;
-    if (rec) {
-      try {
-        rec.start();
-      } catch {
-        // Already started
-      }
-    }
+    engineRef.current = engine;
+    engine?.start();
 
     return () => {
-      recognitionRef.current?.stop();
-      recognitionRef.current = null;
+      engine?.stop();
+      engineRef.current = null;
     };
   }, [slides.length]);
 
-  // Update word position when transcript changes
-  useEffect(() => {
-    if (!slides[currentSlide]) return;
-    const slideWords = slides[currentSlide].split(/\s+/).filter(Boolean);
-    const newIdx = findPosition(slideWords, transcript, wordIdxRef.current);
-    if (newIdx > wordIdxRef.current) {
-      setWordIdx(newIdx);
-    }
-  }, [transcript, currentSlide, slides]);
-
   // Auto-scroll current word into view
   useEffect(() => {
-    const el = wordRefs.current[wordIdx];
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "center" });
-    }
+    wordRefs.current[wordIdx]?.scrollIntoView({
+      behavior: "smooth",
+      block: "center",
+    });
   }, [wordIdx]);
 
   // Auto-advance at 87% completion
   useEffect(() => {
-    if (!slides[currentSlide]) return;
-    const slideWords = slides[currentSlide].split(/\s+/).filter(Boolean);
+    const slideText = slides[currentSlide];
+    if (!slideText) return;
+    const slideWords = slideText.split(/\s+/).filter(Boolean);
     const progress = slideWords.length > 0 ? wordIdx / slideWords.length : 0;
 
     if (
@@ -113,10 +108,10 @@ export function Teleprompter() {
           if (prev === 1) {
             clearInterval(countdownRef.current!);
             countdownRef.current = null;
-            // Advance slide
-            setCurrentSlide(currentSlide + 1);
+            const next = currentSlideRef.current + 1;
+            setCurrentSlide(next);
             setWordIdx(0);
-            setTranscript("");
+            engineRef.current?.resetBuffer();
             return null;
           }
           return (prev - 1) as CountdownState;
@@ -133,61 +128,48 @@ export function Teleprompter() {
     setCountdown(null);
   }, []);
 
-  const restartRecognition = useCallback(() => {
-    const rec = recognitionRef.current;
-    if (!rec) return;
-    try {
-      rec.abort();
-    } catch {
-      // ignore
-    }
-    setTimeout(() => {
-      try {
-        rec.start();
-      } catch {
-        // ignore
-      }
-    }, 300);
-  }, []);
-
   const goToSlide = useCallback(
     (index: number) => {
       if (index < 0 || index >= slides.length) return;
       cancelCountdown();
       setCurrentSlide(index);
       setWordIdx(0);
-      setTranscript("");
-      restartRecognition();
+      setInterimText("");
+      engineRef.current?.resetBuffer();
     },
-    [slides.length, cancelCountdown, setCurrentSlide, restartRecognition]
+    [slides.length, cancelCountdown, setCurrentSlide]
   );
 
   if (slides.length === 0) return null;
 
-  const slideWords = slides[currentSlide]?.split(/\s+/).filter(Boolean) ?? [];
+  const slideText = slides[currentSlide] ?? "";
+  const slideWords = slideText.split(/\s+/).filter(Boolean);
   const totalWords = slideWords.length;
   const progress = totalWords > 0 ? Math.min(wordIdx / totalWords, 1) : 0;
+
+  const isError = micStatus === "error" || micStatus === "not-supported" || micStatus === "no-key";
 
   return (
     <div
       style={{
         display: "flex",
         flexDirection: "column",
-        height: "100vh",
+        height: "100dvh", // dvh for mobile: accounts for browser chrome
         overflow: "hidden",
         background: "var(--bg)",
       }}
     >
-      {/* Header */}
+      {/* ── Header ── */}
       <header
         style={{
           flexShrink: 0,
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          padding: "12px 20px",
+          padding: "12px 16px",
           background: "var(--surface)",
           borderBottom: "1px solid var(--border)",
+          gap: "8px",
         }}
       >
         <span
@@ -196,91 +178,98 @@ export function Teleprompter() {
             fontSize: "13px",
             fontWeight: 600,
             color: "var(--text-mid)",
-            letterSpacing: "0.04em",
+            letterSpacing: "0.05em",
             textTransform: "uppercase",
+            whiteSpace: "nowrap",
           }}
         >
-          Slide {currentSlide + 1}{" "}
-          <span style={{ color: "var(--text-dim)" }}>/ {slides.length}</span>
+          Slide {currentSlide + 1}
+          <span style={{ color: "var(--text-dim)" }}> / {slides.length}</span>
         </span>
         <MicPill status={micStatus} />
       </header>
 
-      {/* Progress bar */}
+      {/* ── Progress bar ── */}
       <div
         style={{
           flexShrink: 0,
           height: "3px",
           background: "var(--surface2)",
           position: "relative",
-          overflow: "hidden",
         }}
       >
         <div
           style={{
             position: "absolute",
-            left: 0,
-            top: 0,
-            bottom: 0,
+            inset: "0 auto 0 0",
             width: `${progress * 100}%`,
             background: "var(--accent)",
-            transition: "width 0.3s ease",
+            transition: "width 0.35s ease",
           }}
         />
       </div>
 
-      {/* Notes area */}
+      {/* ── No API key banner ── */}
+      {micStatus === "no-key" && (
+        <div
+          style={{
+            flexShrink: 0,
+            padding: "10px 16px",
+            background: "rgba(232,84,84,0.12)",
+            borderBottom: "1px solid var(--red)",
+            color: "var(--red)",
+            fontFamily: "var(--font-sans)",
+            fontSize: "13px",
+            textAlign: "center",
+          }}
+        >
+          ⚠ DEEPGRAM_API_KEY is not set. Add it to your Vercel environment variables and redeploy.
+          Manual Prev / Next navigation still works.
+        </div>
+      )}
+
+      {/* ── Notes area ── */}
       <main
         style={{
           flex: 1,
           overflowY: "auto",
-          padding: "40px 24px",
-          maxWidth: "800px",
+          padding: "32px 20px 20px",
+          maxWidth: "820px",
           margin: "0 auto",
           width: "100%",
+          WebkitOverflowScrolling: "touch", // smooth momentum scrolling on iOS
         }}
       >
         <p
           style={{
             fontFamily: "var(--font-serif)",
             fontSize: "clamp(18px, 3.8vw, 26px)",
-            lineHeight: 2.0,
-            color: "var(--text)",
+            lineHeight: 2.1,
             margin: 0,
             wordBreak: "break-word",
           }}
         >
           {slideWords.map((word, i) => {
-            let color: string;
-            let bg: string;
-
-            if (i < wordIdx) {
-              // Spoken
-              color = "var(--text-dim)";
-              bg = "transparent";
-            } else if (i === wordIdx) {
-              // Current
-              color = "var(--accent)";
-              bg = "var(--accent-glow)";
-            } else {
-              // Upcoming
-              color = "var(--text)";
-              bg = "transparent";
-            }
-
+            const isSpoken = i < wordIdx;
+            const isCurrent = i === wordIdx;
             return (
               <span
                 key={`${currentSlide}-${i}`}
-                ref={(el) => {
-                  wordRefs.current[i] = el;
-                }}
+                ref={(el) => { wordRefs.current[i] = el; }}
+                onClick={() => setWordIdx(i)}
                 style={{
-                  color,
-                  background: bg,
+                  color: isSpoken
+                    ? "var(--text-dim)"
+                    : isCurrent
+                    ? "var(--accent)"
+                    : "var(--text)",
+                  background: isCurrent ? "var(--accent-glow)" : "transparent",
                   borderRadius: "4px",
-                  padding: i === wordIdx ? "1px 3px" : "0",
-                  transition: "color 0.15s, background 0.15s",
+                  padding: isCurrent ? "1px 4px" : "0",
+                  transition: "color 0.1s ease, background 0.1s ease",
                   display: "inline",
+                  cursor: "pointer",
+                  WebkitTapHighlightColor: "transparent",
                 }}
               >
                 {word}
@@ -289,16 +278,37 @@ export function Teleprompter() {
             );
           })}
         </p>
+
+        {/* Live interim preview — shows what Deepgram is currently hearing */}
+        {interimText && (
+          <p
+            style={{
+              marginTop: "20px",
+              padding: "8px 14px",
+              background: "var(--surface2)",
+              border: "1px solid var(--border)",
+              borderRadius: "8px",
+              color: "var(--text-dim)",
+              fontFamily: "var(--font-sans)",
+              fontSize: "12px",
+              fontStyle: "italic",
+              opacity: 0.8,
+              margin: "20px 0 0",
+            }}
+          >
+            🎙 {interimText}
+          </p>
+        )}
       </main>
 
-      {/* Footer */}
+      {/* ── Footer ── */}
       <footer
         style={{
           flexShrink: 0,
           display: "flex",
           alignItems: "center",
           justifyContent: "space-between",
-          padding: "12px 20px",
+          padding: "10px 16px",
           background: "var(--surface)",
           borderTop: "1px solid var(--border)",
           gap: "12px",
@@ -309,7 +319,11 @@ export function Teleprompter() {
           style={{
             fontFamily: "var(--font-sans)",
             fontSize: "13px",
-            color: countdown !== null ? "var(--accent)" : "var(--text-dim)",
+            color: countdown !== null
+              ? "var(--accent)"
+              : isError
+              ? "var(--red)"
+              : "var(--text-dim)",
             minWidth: 0,
             overflow: "hidden",
             textOverflow: "ellipsis",
@@ -320,14 +334,20 @@ export function Teleprompter() {
             ? `Advancing in ${countdown}…`
             : micStatus === "listening"
             ? "Listening…"
+            : micStatus === "connecting"
+            ? "Connecting to Deepgram…"
+            : micStatus === "reconnecting"
+            ? "Reconnecting…"
             : micStatus === "error"
-            ? "Mic access denied — use buttons below"
+            ? "Mic denied — use Prev / Next"
+            : micStatus === "no-key"
+            ? "Add API key to Vercel"
             : micStatus === "not-supported"
-            ? "Voice tracking unavailable — use buttons"
-            : "Waiting for mic…"}
+            ? "Voice unavailable — use buttons"
+            : "Starting…"}
         </span>
 
-        {/* Nav buttons */}
+        {/* Nav buttons — larger tap targets on mobile */}
         <div style={{ display: "flex", gap: "8px", flexShrink: 0 }}>
           <NavButton
             onClick={() => goToSlide(currentSlide - 1)}
@@ -359,18 +379,22 @@ function NavButton({
       onClick={onClick}
       disabled={disabled}
       style={{
-        padding: "8px 16px",
+        minWidth: "72px",
+        padding: "10px 18px",
         borderRadius: "8px",
         border: "1px solid var(--border)",
         background: disabled ? "transparent" : "var(--surface2)",
         color: disabled ? "var(--text-dim)" : "var(--text)",
         fontFamily: "var(--font-sans)",
-        fontSize: "13px",
+        fontSize: "14px",
         fontWeight: 500,
         cursor: disabled ? "not-allowed" : "pointer",
-        transition: "background 0.15s, color 0.15s",
         opacity: disabled ? 0.4 : 1,
+        transition: "background 0.12s, opacity 0.12s",
         userSelect: "none",
+        WebkitUserSelect: "none",
+        WebkitTapHighlightColor: "transparent",
+        touchAction: "manipulation",
       }}
     >
       {label}

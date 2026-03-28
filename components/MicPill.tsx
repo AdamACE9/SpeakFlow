@@ -1,6 +1,13 @@
 "use client";
 
-export type MicStatus = "idle" | "listening" | "error" | "not-supported";
+export type MicStatus =
+  | "idle"
+  | "connecting"
+  | "listening"
+  | "reconnecting"
+  | "error"
+  | "no-key"
+  | "not-supported";
 
 interface MicPillProps {
   status: MicStatus;
@@ -8,16 +15,15 @@ interface MicPillProps {
 
 const statusConfig: Record<
   MicStatus,
-  { label: string; dotColor: string; pulse: boolean }
+  { label: string; dotColor: string; pulse: boolean; spin?: boolean }
 > = {
-  idle: { label: "Mic idle", dotColor: "var(--text-dim)", pulse: false },
-  listening: { label: "Listening", dotColor: "var(--green)", pulse: true },
-  error: { label: "Mic denied", dotColor: "var(--red)", pulse: false },
-  "not-supported": {
-    label: "Mic unsupported",
-    dotColor: "var(--red)",
-    pulse: false,
-  },
+  idle:          { label: "Mic idle",        dotColor: "var(--text-dim)", pulse: false },
+  connecting:    { label: "Connecting…",     dotColor: "var(--accent)",   pulse: true  },
+  listening:     { label: "Listening",       dotColor: "var(--green)",    pulse: true  },
+  reconnecting:  { label: "Reconnecting…",  dotColor: "var(--accent)",   pulse: true  },
+  error:         { label: "Mic denied",      dotColor: "var(--red)",      pulse: false },
+  "no-key":      { label: "No API key",      dotColor: "var(--red)",      pulse: false },
+  "not-supported": { label: "Unsupported",   dotColor: "var(--red)",      pulse: false },
 };
 
 export function MicPill({ status }: MicPillProps) {
@@ -37,6 +43,7 @@ export function MicPill({ status }: MicPillProps) {
         fontFamily: "var(--font-sans)",
         color: "var(--text-mid)",
         userSelect: "none",
+        whiteSpace: "nowrap",
       }}
     >
       <span
@@ -47,13 +54,13 @@ export function MicPill({ status }: MicPillProps) {
           background: dotColor,
           display: "inline-block",
           flexShrink: 0,
-          animation: pulse ? "speakflow-pulse 1.4s ease-in-out infinite" : "none",
+          animation: pulse ? "sf-pulse 1.4s ease-in-out infinite" : "none",
         }}
       />
       <style>{`
-        @keyframes speakflow-pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.35; }
+        @keyframes sf-pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.4; transform: scale(0.8); }
         }
       `}</style>
       {label}
