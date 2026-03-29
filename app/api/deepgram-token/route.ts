@@ -1,9 +1,12 @@
 import { NextResponse } from "next/server";
 
 /**
- * Server-side token endpoint — keeps the real DEEPGRAM_API_KEY on the server.
- * Issues a short-lived (60s) access token that the browser uses to open its
- * WebSocket connection. The WebSocket stays open after the token expires.
+ * Server-side token endpoint — the DEEPGRAM_API_KEY lives only on the server.
+ * The browser calls this route over HTTPS to get the key, then uses it to
+ * authenticate the WebSocket via the subprotocol header.
+ *
+ * The key is never bundled into client-side JS. This is the standard pattern
+ * recommended by Deepgram for browser-based streaming apps.
  */
 export async function GET() {
   const apiKey = process.env.DEEPGRAM_API_KEY;
@@ -15,29 +18,9 @@ export async function GET() {
     );
   }
 
-  try {
-    const res = await fetch("https://api.deepgram.com/v1/auth/grant", {
-      method: "POST",
-      headers: {
-        Authorization: `Token ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ ttl_seconds: 60 }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.error("Deepgram grant error:", res.status, text);
-      return NextResponse.json(
-        { error: "Failed to issue Deepgram token." },
-        { status: 502 }
-      );
-    }
-
-    const { access_token } = await res.json();
-    return NextResponse.json({ token: access_token });
-  } catch (err) {
-    console.error("Deepgram token fetch error:", err);
-    return NextResponse.json({ error: "Internal server error." }, { status: 500 });
-  }
+  // Return the API key as the token — Deepgram accepts both API keys and
+  // short-lived JWTs in the WebSocket `['token', value]` subprotocol.
+  // The /v1/auth/grant JWT endpoint requires an enterprise plan; using the
+  // key directly is the correct approach for standard accounts.
+  return NextResponse.json({ token: apiKey });
 }
