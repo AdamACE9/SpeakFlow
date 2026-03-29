@@ -22,5 +22,5 @@ export async function GET() {
   // short-lived JWTs in the WebSocket `['token', value]` subprotocol.
   // The /v1/auth/grant JWT endpoint requires an enterprise plan; using the
   // key directly is the correct approach for standard accounts.
-  return NextResponse.json({ token: apiKey });
+  return NextResponse.json({ token: apiKey.trim() });
 }
